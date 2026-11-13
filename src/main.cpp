@@ -1,9 +1,7 @@
+#include "vulkan/VulkanInclude.hpp"
+#include "vulkan/Device.hpp"
+
 #include <memory>
-#if defined(__INTELLISENSE__) || !defined(USE_CPP20_MODULES)
-#	include <vulkan/vulkan_raii.hpp>
-#else
-import vulkan_hpp;
-#endif
 #include <GLFW/glfw3.h>
 
 #include <cstdlib>
@@ -49,11 +47,9 @@ class HelloTriangleApplication
 	vk::raii::DebugUtilsMessengerEXT debugMessenger = nullptr;
 	vk::raii::SurfaceKHR surface = nullptr;
 
-	vk::raii::PhysicalDevice physicalDevice = nullptr;
-	vk::raii::Device 		 device = nullptr;
-
-	uint32_t 		queueIndex = ~0;
-	vk::raii::Queue queue = nullptr;
+	// order of declaration matters as the members will be destroyed in the opposite order 
+	// and swapchain, buffers before the device
+	Device device; 
 	
 	vk::raii::SwapchainKHR swapChain = nullptr;
 	std::vector<vk::Image> swapChainImages;
@@ -86,8 +82,7 @@ class HelloTriangleApplication
 		createInstance();
 		setupDebugMessenger();
 		createSurface();
-		pickPhysicalDevice();
-		createLogicalDevice();
+		device.create(instance, surface); // picks physical device and crates logical
 		createSwapChain();
 		createImageViews();
 		createGraphicsPipeline();
@@ -104,23 +99,23 @@ class HelloTriangleApplication
 			drawFrame();
 		}
 
-		device.waitIdle();
+		device.getLogical().waitIdle();
 	}
 
 	void drawFrame()
 	{
-		auto fenceResult = device.waitForFences(*drawFence, vk::True, UINT64_MAX);
+		auto fenceResult = device.getLogical().waitForFences(*drawFence, vk::True, UINT64_MAX);
 		if (fenceResult != vk::Result::eSuccess)
 		{
 			throw std::runtime_error("failed to wait for fence!");
 		}
-		device.resetFences(*drawFence);
+		device.getLogical().resetFences(*drawFence);
 
 		auto [result, imageIndex] = swapChain.acquireNextImage(UINT64_MAX, *presentCompleteSemaphore, nullptr);
 
 		recordCommandBuffer(imageIndex);
 
-		queue.waitIdle();        // NOTE: for simplicity, wait for the queue to be idle before starting the frame
+		device.getQueue().waitIdle();        // NOTE: for simplicity, wait for the queue to be idle before starting the frame
 		                         // In the next chapter you see how to use multiple frames in flight and fences to sync
 
 		vk::PipelineStageFlags waitDestinationStageMask(vk::PipelineStageFlagBits::eColorAttachmentOutput);
@@ -131,10 +126,10 @@ class HelloTriangleApplication
 		                                  .pCommandBuffers      = &*commandBuffer,
 		                                  .signalSemaphoreCount = 1,
 		                                  .pSignalSemaphores    = &*renderFinishedSemaphore};
-		queue.submit(submitInfo, *drawFence);
+		device.getQueue().submit(submitInfo, *drawFence);
 
 		const vk::PresentInfoKHR presentInfoKHR{.waitSemaphoreCount = 1, .pWaitSemaphores = &*renderFinishedSemaphore, .swapchainCount = 1, .pSwapchains = &*swapChain, .pImageIndices = &imageIndex};
-		result = queue.presentKHR(presentInfoKHR);
+		result = device.getQueue().presentKHR(presentInfoKHR);
 		switch (result)
 		{
 			case vk::Result::eSuccess:
@@ -222,69 +217,7 @@ class HelloTriangleApplication
 																			.pfnUserCallback = &debugCallback};
 		debugMessenger = instance.createDebugUtilsMessengerEXT( debugUtilsMessengerCreateInfoEXT );
 	}
-
-	void createSurface()
-	{
-		VkSurfaceKHR _surface;
-		if (glfwCreateWindowSurface(*instance, window, nullptr, &_surface) != 0)
-		{
-			throw std::runtime_error("failed to create window surface!");
-		}
-		surface = vk::raii::SurfaceKHR(instance, _surface);
-	}
-
-	// inspect devices and pick one if it suitable
-	std::vector<const char*> requiredDeviceExtension = {vk::KHRSwapchainExtensionName};
-
-	bool isDeviceSuitable( vk::raii::PhysicalDevice const & physicalDevice )
-	{
-		// Check if the physicalDevice supports the Vulkan 1.3 API version
-		bool supportsVulkan1_3 = physicalDevice.getProperties().apiVersion >= vk::ApiVersion13;
-
-		// Check if any of the queue families support graphics operations
-		auto queueFamilies    = physicalDevice.getQueueFamilyProperties();
-		// why the double !! are required
-		// the return type of the opperation qfp.queueFlags & vk::QueueFlagBits::eGraphics is vk::QueueFlags
-		// the conversion to bool has to be made explicit using ! (and the second ! is used to convert it back to the correct bool output)
-		bool supportsGraphics = std::ranges::any_of( queueFamilies, []( auto const & qfp ) { return !!( qfp.queueFlags & vk::QueueFlagBits::eGraphics ); } );
-
-		// Check if all required physicalDevice extensions are available
-		auto availableDeviceExtensions = physicalDevice.enumerateDeviceExtensionProperties();
-		bool supportsAllRequiredExtensions =
-			std::ranges::all_of( requiredDeviceExtension,
-								[&availableDeviceExtensions]( auto const & requiredDeviceExtension )
-								{
-								return std::ranges::any_of( availableDeviceExtensions,
-															[requiredDeviceExtension]( auto const & availableDeviceExtension )
-															{ return strcmp( availableDeviceExtension.extensionName, requiredDeviceExtension ) == 0; } );
-								} );
-
-		// Check if the physicalDevice supports the required features (shader draw parameters, dynamic rendering and extended dynamic state)
-		auto features                 = physicalDevice.template getFeatures2<vk::PhysicalDeviceFeatures2,
-																			vk::PhysicalDeviceVulkan11Features,
-																			vk::PhysicalDeviceVulkan13Features,
-																			vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>();
-		bool supportsRequiredFeatures = features.template get<vk::PhysicalDeviceVulkan11Features>().shaderDrawParameters &&
-										features.template get<vk::PhysicalDeviceVulkan13Features>().synchronization2 && // the order of declaring features is important!! 
-										// in PhysicalDeviceVulkan13Features synchronization2 is declared before dynamicRendering, so the order must follow
-										features.template get<vk::PhysicalDeviceVulkan13Features>().dynamicRendering &&
-										features.template get<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>().extendedDynamicState;
-
-		// Return true if the physicalDevice meets all the criteria
-		return supportsVulkan1_3 && supportsGraphics && supportsAllRequiredExtensions && supportsRequiredFeatures;
-	}
-
-	void pickPhysicalDevice()
-	{
-		std::vector<vk::raii::PhysicalDevice> physicalDevices = instance.enumeratePhysicalDevices();
-		auto const devIter = std::ranges::find_if( physicalDevices, [&]( auto const & physicalDevice ) { return isDeviceSuitable( physicalDevice ); } );
-		if ( devIter == physicalDevices.end() )
-		{
-			throw std::runtime_error( "failed to find a suitable GPU!" );
-		}
-		physicalDevice = *devIter;
-	}
-
+	
 	// For the debug messages
 	static VKAPI_ATTR vk::Bool32 VKAPI_CALL debugCallback(vk::DebugUtilsMessageSeverityFlagBitsEXT       severity,
 														vk::DebugUtilsMessageTypeFlagsEXT              type,
@@ -299,72 +232,27 @@ class HelloTriangleApplication
 		return vk::False;
 	}
 
-
-	void createLogicalDevice(){
-		// find the index of the first queue family that supports graphics
-		std::vector<vk::QueueFamilyProperties> queueFamilyProperties = physicalDevice.getQueueFamilyProperties();
-
-		// ~ is a bit negation opperation, so all bits in 0 will be flipped to 0xFFFFFFFF 
-		// find the first index of the queue family that supports graphics and present a windows surface
-		for (uint32_t qfpIndex = 0; qfpIndex < queueFamilyProperties.size(); qfpIndex++)
+	void createSurface()
+	{
+		VkSurfaceKHR _surface;
+		if (glfwCreateWindowSurface(*instance, window, nullptr, &_surface) != 0)
 		{
-			if ((queueFamilyProperties[qfpIndex].queueFlags & vk::QueueFlagBits::eGraphics) &&
-				physicalDevice.getSurfaceSupportKHR(qfpIndex, *surface))
-				{
-					// found a queue family that supports both graphics and present
-					queueIndex = qfpIndex;
-					break;
-				}
+			throw std::runtime_error("failed to create window surface!");
 		}
-		if (queueIndex == ~0)
-		{
-			throw std::runtime_error("Could not find a queue for graphics and present -> terminating");
-		}
-
-		// query for Vulkan 1.3 features
-		// chain of features connected automatically by Vulkan using pNext
-		vk::StructureChain<vk::PhysicalDeviceFeatures2,
-		                   vk::PhysicalDeviceVulkan11Features,
-		                   vk::PhysicalDeviceVulkan13Features,
-		                   vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>
-		    featureChain = {
-		        {},                                    // vk::PhysicalDeviceFeatures2
-		        {.shaderDrawParameters = true},        // vk::PhysicalDeviceVulkan11Features
-		        {.synchronization2 = true, .dynamicRendering = true},            // vk::PhysicalDeviceVulkan13Features
-		        {.extendedDynamicState = true}         // vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT
-		    };
-
-		// create a Device
-		float                     queuePriority = 0.5f;
-		vk::DeviceQueueCreateInfo deviceQueueCreateInfo{.queueFamilyIndex = queueIndex, .queueCount = 1, .pQueuePriorities = &queuePriority};
-		vk::DeviceCreateInfo      deviceCreateInfo{.pNext                   = &featureChain.get<vk::PhysicalDeviceFeatures2>(),
-		                                           .queueCreateInfoCount    = 1,
-		                                           .pQueueCreateInfos       = &deviceQueueCreateInfo,
-		                                           .enabledExtensionCount   = static_cast<uint32_t>(requiredDeviceExtension.size()),
-		                                           .ppEnabledExtensionNames = requiredDeviceExtension.data()};
-
-		device = vk::raii::Device(physicalDevice, deviceCreateInfo);
-		queue = vk::raii::Queue(device, queueIndex, 0);
-
-		// only query for surface support after that extension was verified
-		// gets the specifications for the surface (min/max number of images and their min/max height and width)
-		auto surfaceCapabilities = physicalDevice.getSurfaceCapabilitiesKHR(*surface);
-		// quering surface formats (pixel format, color space)
-		std::vector<vk::SurfaceFormatKHR> availableFormats = physicalDevice.getSurfaceFormatsKHR( *surface );
-		// quering available presentation models
-		std::vector<vk::PresentModeKHR> availablePresentModes = physicalDevice.getSurfacePresentModesKHR( *surface );
+		surface = vk::raii::SurfaceKHR(instance, _surface);
 	}
+
 	
 	void createSwapChain() 
 	{
-		vk::SurfaceCapabilitiesKHR surfaceCapabilities = physicalDevice.getSurfaceCapabilitiesKHR( *surface );
+		vk::SurfaceCapabilitiesKHR surfaceCapabilities = device.getPhysical().getSurfaceCapabilitiesKHR( *surface );
 		swapChainExtent                                = chooseSwapExtent(surfaceCapabilities);
 		uint32_t minImageCount                         = chooseSwapMinImageCount(surfaceCapabilities);
 
-		std::vector<vk::SurfaceFormatKHR> availableFormats = physicalDevice.getSurfaceFormatsKHR(*surface);
+		std::vector<vk::SurfaceFormatKHR> availableFormats = device.getPhysical().getSurfaceFormatsKHR(*surface);
 		swapChainSurfaceFormat                             = chooseSwapSurfaceFormat(availableFormats);
 
-		std::vector<vk::PresentModeKHR> availablePresentModes = physicalDevice.getSurfacePresentModesKHR(*surface);
+		std::vector<vk::PresentModeKHR> availablePresentModes = device.getPhysical().getSurfacePresentModesKHR(*surface);
 		vk::PresentModeKHR              presentMode           = chooseSwapPresentMode(availablePresentModes);
 
 		vk::SwapchainCreateInfoKHR swapChainCreateInfo{.surface          = *surface,
@@ -380,7 +268,7 @@ class HelloTriangleApplication
                                                .presentMode      = chooseSwapPresentMode(availablePresentModes),
                                                .clipped          = true};
 		
-		swapChain = vk::raii::SwapchainKHR(device, swapChainCreateInfo);
+		swapChain = vk::raii::SwapchainKHR(device.getLogical(), swapChainCreateInfo);
 		swapChainImages = swapChain.getImages();
 	}
 
@@ -402,7 +290,7 @@ class HelloTriangleApplication
 		for (auto &image : swapChainImages)
 		{
 			imageViewCreateInfo.image = image;
-			swapChainImageViews.emplace_back( device, imageViewCreateInfo );
+			swapChainImageViews.emplace_back( device.getLogical(), imageViewCreateInfo );
 		}
 	}
 
@@ -446,7 +334,7 @@ class HelloTriangleApplication
 		vk::PipelineDynamicStateCreateInfo dynamicState{.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size()), .pDynamicStates = dynamicStates.data()};
 
 		vk::PipelineLayoutCreateInfo pipelineLayoutInfo{.setLayoutCount = 0, .pushConstantRangeCount = 0};
-		pipelineLayout = vk::raii::PipelineLayout(device, pipelineLayoutInfo);
+		pipelineLayout = vk::raii::PipelineLayout(device.getLogical(), pipelineLayoutInfo);
 	
 		// reference each stage of the pipeline
 		vk::StructureChain<vk::GraphicsPipelineCreateInfo, vk::PipelineRenderingCreateInfo> pipelineCreateInfoChain = {
@@ -464,17 +352,17 @@ class HelloTriangleApplication
 			{.colorAttachmentCount = 1, .pColorAttachmentFormats = &swapChainSurfaceFormat.format}};
 
 			// create the pipeline
-			graphicsPipeline = vk::raii::Pipeline(device, nullptr, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
+			graphicsPipeline = vk::raii::Pipeline(device.getLogical(), nullptr, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
 	}
 
 	void createCommandPool(){
 		// eResetCommandBuffer flag allows command buffers to be rerecorded individually 
 		vk::CommandPoolCreateInfo poolInfo{.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
-                                   .queueFamilyIndex = queueIndex};
+                                   .queueFamilyIndex = device.getQueueIndex()};
 
 		//Each command pool can only allocate command buffers that are submitted on a single type of queue
 		// the graphics queue family was chosen to record drawing commands
-		commandPool = vk::raii::CommandPool(device, poolInfo);
+		commandPool = vk::raii::CommandPool(device.getLogical(), poolInfo);
 	}
 
 	void createCommandBuffer()
@@ -482,7 +370,7 @@ class HelloTriangleApplication
 		// ePrimary allows for submition to a queue for excecution 
 		vk::CommandBufferAllocateInfo allocInfo{ .commandPool = commandPool, .level = vk::CommandBufferLevel::ePrimary, .commandBufferCount = 1 };
 
-		commandBuffer = std::move(vk::raii::CommandBuffers(device, allocInfo).front());
+		commandBuffer = std::move(vk::raii::CommandBuffers(device.getLogical(), allocInfo).front());
 	}
 
 	void recordCommandBuffer(uint32_t imageIndex)
@@ -565,9 +453,9 @@ class HelloTriangleApplication
 	}
 
 	void createSyncObjects(){
-		presentCompleteSemaphore = vk::raii::Semaphore(device, vk::SemaphoreCreateInfo());
-		renderFinishedSemaphore  = vk::raii::Semaphore(device, vk::SemaphoreCreateInfo());
-		drawFence                = vk::raii::Fence(device, {.flags = vk::FenceCreateFlagBits::eSignaled});
+		presentCompleteSemaphore = vk::raii::Semaphore(device.getLogical(), vk::SemaphoreCreateInfo());
+		renderFinishedSemaphore  = vk::raii::Semaphore(device.getLogical(), vk::SemaphoreCreateInfo());
+		drawFence                = vk::raii::Fence(device.getLogical(), {.flags = vk::FenceCreateFlagBits::eSignaled});
 	}
 
 	std::vector<const char*> getRequiredInstanceExtensions(){
@@ -637,7 +525,7 @@ class HelloTriangleApplication
 	[[nodiscard]] vk::raii::ShaderModule createShaderModule(const std::vector<char>& code) const
 	{
 		vk::ShaderModuleCreateInfo createInfo{.codeSize = code.size() * sizeof(char), .pCode = reinterpret_cast<const uint32_t*>(code.data()) };
-		vk::raii::ShaderModule shaderModule{device, createInfo};
+		vk::raii::ShaderModule shaderModule{device.getLogical(), createInfo};
 		return shaderModule;
 	}
 
