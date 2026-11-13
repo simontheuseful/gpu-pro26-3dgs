@@ -14,3 +14,7 @@ if the *build/* directory has not yet been created
 
 ## Output
 - the *.exe* file will be located in *build/bin/*
+
+### Adding new files
+if intelliSense does not check the code, run:
+- `>Cmake: Configure (in VSCode)`
